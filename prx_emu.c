@@ -432,7 +432,7 @@ static int handle_sms(struct sms *sms)
 
         pjsip_generic_string_hdr x_carr;
 	pj_str_t hname = pj_str("X-SpeakUp-Carrier-Select");
-	pj_str_t hvalue = pj_str(sms->dest_smsc);//("pgsm");
+	pj_str_t hvalue = pj_str("pgsm");
 	pjsip_generic_string_hdr_init2(&x_carr, &hname, &hvalue);
         pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)&x_carr);
 
@@ -583,9 +583,9 @@ int main(void)
         }
 
         while (1) {
-        	//pj_time_val delay = {0, 0};
-		//pjsip_endpt_handle_events(sip_endpt, &delay);
-		struct sms sms;
+        	pj_time_val delay = {0, 0};
+		pjsip_endpt_handle_events(sip_endpt, &delay);
+		/*struct sms sms;
 		strcpy(sms.from, "31632271497");
 		strcpy(sms.to, "31632271497");
 		strcpy(sms.text, "cialapud");
@@ -593,7 +593,7 @@ int main(void)
 		handle_sms(&sms);
 		strcpy(sms.dest_smsc, "pgsm");
 		handle_sms(&sms);
-		sleep(rand() % 10);
+		sleep(rand() % 10);*/
         }
 
         destroy_sip();

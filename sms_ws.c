@@ -19,10 +19,10 @@
  * UTILS *
  *********/
 
-#define TIMESTAMP_LENGTH	10
 #define MSISDN_LENGTH		15
 #define TEXT_LENGTH		1024
 #define SMSC_LENGTH		10
+#define MID_LENGTH		255
 
 #define DELIVERY_SUCCESS	1
 #define DELIVERY_FAILURE	2
@@ -31,11 +31,9 @@
 #define SMSC_REJECT		16
 
 #define DLR_404		"NACK/0x0000000b/Invalid+Destination+Address"
-#define DLR_410         "NACK/0x00000044/Cannot+Submit+to+Distribution+List"
-#define DLR_480		"NACK/0x000000fe/Transaction+Delivery+Failure"
+#define DLR_410         "NACK/0x000000fe/Transaction+Delivery+Failure"
 
 struct sms {
-	char ts[TIMESTAMP_LENGTH];		/* sms tx timestamp in UNIX epoch */
 	char from[MSISDN_LENGTH];		/* sms sender */
 	char to[MSISDN_LENGTH];			/* sms receiver */
 	char text[TEXT_LENGTH];			/* sms text */
@@ -51,7 +49,23 @@ static void cannot_execute(int client);
 static void unimplemented(int client);
 
 static int send_to_kannel(struct sms *sms, unsigned ref);
-static int send_dlr_to_kannel(unsigned ref, int dlr_state);
+static int send_dlr_to_kannel(int dlr_state, char *mid, char *to);
+
+char *strstrtok(char *str, char *delim)
+{
+    static char *prev;
+    if (!str) str = prev;
+    if (str) {
+        char *end = strstr(str, delim);
+        if (end) {
+            prev = end + strlen(delim);
+            *end = 0;
+        } else {
+            prev = 0;
+        }
+    }
+    return str;
+}
 
 /*****************
  * SIP INTERFACE *
@@ -279,14 +293,7 @@ static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
 
 			PJ_LOG(3,(THIS_FILE, "[%u] UAS state TERMINATED", session->ref));
 
-			int dlr_state;
-	                if (tsx->status_code)
-				dlr_state = 31;
-			else
-				dlr_state = 16; //fixme
-
-			// send dlr back to kannel
-                        destroy_session(session);
+			destroy_session(session);
 
 		}
 
@@ -304,16 +311,6 @@ static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
 		} else if (tsx->state == PJSIP_TSX_STATE_TERMINATED) {
 
 			PJ_LOG(3,(THIS_FILE, "[%u] UAC state TERMINATED", session->ref));
-
-			int dlr_state;
-                        if (tsx->status_code)
-                                dlr_state = 8;
-                        else
-                                dlr_state = 16; //fixme
-
-                        // send dlr back to kannel
-			//send_dlr_to_kannel(session->ref, dlr_state);
-
 
                         destroy_session(session);
 
@@ -407,7 +404,6 @@ static void process_proxy_request(pjsip_rx_data *rdata)
         pj_strdup(session->pool, &cid, &rdata->msg_info.cid->id);
 	strtok((char*)pj_strbuf(&cid), CID_DELIMITERS);
 	PJ_LOG(3,(THIS_FILE, "[%u] ***Call-ID*** %s", session->ref, pj_strbuf(&cid)));
-	printf("[%u] ***Call-ID*** %s\n", session->ref, pj_strbuf(&cid));
 
 	// PARSE PROXY REQUEST
 	parse_prx_request(rdata, &sms);
@@ -510,6 +506,7 @@ static int handle_sms(struct sms *sms, int client)
 		app_perror("Failed to create request message", status);
 		return 0;
     	}
+	//FIXME
 	pjsip_generic_string_hdr x_carr;
         pj_str_t hname = pj_str("X-SpeakUp-TrunkType");
         pj_str_t hvalue = pj_str("airtime");
@@ -545,8 +542,8 @@ static int handle_sms(struct sms *sms, int client)
 						pj_strbuf(&cid_h->hvalue)));
         }
 
-	PJ_LOG(3,(THIS_FILE, "[%u] SMS: from=%s, to=%s, text=%s, orig_smsc=%s, ts=%s",
-                session->ref, sms->from, sms->to, sms->text, sms->orig_smsc, sms->ts));
+	PJ_LOG(3,(THIS_FILE, "[%u] SMS: from=%s, to=%s, text=%s, orig_smsc=%s",
+                session->ref, sms->from, sms->to, sms->text, sms->orig_smsc));
 
 	// SEND REQUEST MESSAGE
     	status = pjsip_tsx_send_msg(session->tsx, tdata);
@@ -582,17 +579,14 @@ static int handle_dlr(unsigned ref, int dlr_type, char *dlr_cause, int client)
 
 	switch (dlr_type) {
 	case DELIVERY_SUCCESS:
-		status_code = 100;
+		status_code = 200;
 		break;
 	case DELIVERY_FAILURE:
 		status_code = 480;
 		break;
 	case MESSAGE_BUFFERED:
-		status_code = 182;
-		break;
 	case SMSC_SUBMIT:
-		status_code = 200;
-		break;
+		return 0; //FIXME?!
 	case SMSC_REJECT:
 		if (!strcmp(dlr_cause, DLR_404)) {
                         status_code = 404;
@@ -602,11 +596,8 @@ static int handle_dlr(unsigned ref, int dlr_type, char *dlr_cause, int client)
 			status_code = 410;
 			break;
 		}
-		if (!strcmp(dlr_cause, DLR_480)) {
-			status_code = 480;
-			break;
-		}
-		goto send_response;
+		status_code = 404; //FIXME
+		break;
 	default:
 		goto internal_error;
 	}
@@ -614,10 +605,8 @@ static int handle_dlr(unsigned ref, int dlr_type, char *dlr_cause, int client)
 	// UPDATE RESPONSE
 	session->uas_tdata->msg->line.status.code = status_code;
 
-send_response:
 	// SEND RESPONSE
-	PJ_LOG(3,(THIS_FILE, "send %d response to the proxy",
-			session->uas_tdata->msg->line.status.code));
+	PJ_LOG(3,(THIS_FILE, "send %d response to the proxy", status_code));
         status = pjsip_tsx_send_msg(session->tsx, session->uas_tdata);
         if (status != PJ_SUCCESS)
                 goto internal_error;
@@ -778,8 +767,8 @@ static void destroy_sip()
 #define SERVER_HOST "193.169.138.177:13013"
 #define DLR_SERVER_HOST "193.169.138.177:13015"
 
-#define SENDSMS_REQUEST "/cgi-bin/sendsms?username=spup&password=spup&from=%s&to=%s&text=%s&smsc=%s&dlr-mask=31&dlr-url="
-#define DLR_URL "http://193.169.138.177:50000/dlr?%d&%A&"
+#define SENDSMS_REQUEST "/cgi-bin/sendsms?username=spup&password=spup&from=%s&to=%s&text=%s&smsc=%s&dlr-mask=3&dlr-url="
+#define DLR_URL "http://193.169.138.177:50000/dlr?type=%d&cause=%A&mid=%F&to=%p&meta-data=%D&ref="
 
 /* 200 OK message */
 static void headers(int client)
@@ -798,7 +787,7 @@ static void headers(int client)
 	send(client, buf, strlen(buf), 0);
 	sprintf(buf, "Content-Type: text/html\r\n");
 	send(client, buf, strlen(buf), 0);
-	sprintf(buf, "\r\n");
+	sprintf(buf, "<P>Ok.\r\n");
 	send(client, buf, strlen(buf), 0);
 
 	// CLOSE CLIENT SOCKET
@@ -825,7 +814,7 @@ static void accepted(int client)
 	send(client, buf, strlen(buf), 0);
 	sprintf(buf, "\r\n");
 	send(client, buf, strlen(buf), 0);
-	sprintf(buf, "<P>Accepted request\r\n");
+	sprintf(buf, "<P>Accepted request.\r\n");
 	send(client, buf, strlen(buf), 0);
 }
 
@@ -992,7 +981,7 @@ static void accept_http_request(int client)
 {
 	struct sms sms;
         char buf[1024], method[255], url[255];
-	char dlr_cause[255];
+	char dlr_cause[255], to[MSISDN_LENGTH], mid[MID_LENGTH];
 	unsigned ref;
 	int dlr_type;
 
@@ -1024,76 +1013,104 @@ static void accept_http_request(int client)
                 return;
         }
 
-	//printf("%s\n", url);
+	printf("%s\n", url);
 
 	// WE ONLY PROCESS GET REQUESTS
         if (strcasecmp(method, "GET") == 0) {
 		char *service, *token;
 
-		service = strtok(url, "?");
+		service = strstrtok(url, "?");
 		if (!service) {
 			bad_request(client);
                         return;
                 }
 		if (!strcmp(service, "/dlr")) {
 			// DLR TYPE
-			token = strtok(NULL, "&");
+			token = strstrtok(NULL, "type=");
+			token = strstrtok(NULL, "&");
 			if (!token) {
                                 bad_request(client);
                                 return;
                         }
 			dlr_type = atoi(token);
 			// DLR CAUSE
-                        token = strtok(NULL, "&");
+			token = strstrtok(NULL, "cause=");
+                        token = strstrtok(NULL, "&");
                         if (!token) {
                                 bad_request(client);
                                 return;
                         }
                         strncpy(dlr_cause, curl_unescape(token, 0), 255);
 			// MSG ID
-			token = strtok(NULL, "&");
+			token = strstrtok(NULL, "mid=");
+			token = strstrtok(NULL, "&");
                         if (!token) {
                                 bad_request(client);
                                 return;
                         }
-			ref = atoi(token);
+			strncpy(mid, curl_unescape(token, 0), MID_LENGTH);
+			// TO
+                        token = strstrtok(NULL, "to=");
+                        token = strstrtok(NULL, "&");
+                        if (!token) {
+                                bad_request(client);
+                                return;
+                        }
+			strncpy(to, token, MSISDN_LENGTH);
+			// META-DATA
+                        token = strstrtok(NULL, "meta-data=");
+                        token = strstrtok(NULL, "&");
+                        if (!token) {
+                                bad_request(client);
+                                return;
+                        }
+			char md[1024];
+                        strncpy(md, curl_unescape(token, 0), 1024);
+			printf("*********METADATA %s\n", md);
+			// REF
+			token = strstrtok(NULL, "ref=");
+			token = strstrtok(NULL, "&");
+                        if (!token) {
+                                bad_request(client);
+                                return;
+                        }
+                        ref = atoi(token);
 			// HANDLE DELIVERY REPORT
 			if (handle_dlr(ref, dlr_type, dlr_cause, client))
 				accepted(client); //HTTP 202
                         else
                                 cannot_execute(client); //HTTP 500
+
+			//send_dlr_to_kannel(dlr_type, mid, to);
 		}
 		else if (!strcmp(service, "/sms")) {
-			// TIMESTAMP
-			token = strtok(NULL, "&");
-                        if (!token) {
-                                bad_request(client);
-                                return;
-                        }
-                        strncpy(sms.ts, token, TIMESTAMP_LENGTH);
-			// FROM
-			token = strtok(NULL, "&");
+			// TO
+			token = strstrtok(NULL, "to=");
+			token = strstrtok(NULL, "&");
         	        if (!token) {
                 	        bad_request(client);
                         	return;
 	                }
-        	        strncpy(sms.from, token, MSISDN_LENGTH);
-			// TO
-                	token = strtok(NULL, "&");
-	                if (!token) {
-        	                bad_request(client);
-                	        return;
-	                }
         	        strncpy(sms.to, token, MSISDN_LENGTH);
 			// TEXT
-                	token = strtok(NULL, "&");
+			token = strstrtok(NULL, "text=");
+                        token = strstrtok(NULL, "&");
+                        if (!token) {
+                                bad_request(client);
+                                return;
+                        }
+                        strncpy(sms.text, token, TEXT_LENGTH);
+			// FROM
+			token = strstrtok(NULL, "from=");
+                	token = strstrtok(NULL, "&");
 	                if (!token) {
         	                bad_request(client);
                 	        return;
 	                }
-        	        strncpy(sms.text, token, TEXT_LENGTH);
+        	        strncpy(sms.from, token, MSISDN_LENGTH);
 			// ORIGIN SMSC
-                	token = strtok(NULL, "&");
+			token = strstrtok(NULL, "smsc=");
+                	token = strstrtok(NULL, "&");
 	                if (!token) {
         	                bad_request(client);
                 	        return;
@@ -1130,7 +1147,7 @@ static int send_to_kannel(struct sms *sms, unsigned ref)
 
 	// CREATE DLR URL
         sprintf(dlr_url, "%s%u", DLR_URL, ref);
-	//printf("%s\n", dlr_url); //DEBUG
+	printf("%s\n", dlr_url); //DEBUG
 
 	// UNITE THEM TO FORM KANNEL'S HTTP REQUEST
         sprintf(buf, "%s%s%s", SERVER_HOST, sendsms, curl_escape(dlr_url, 0));
@@ -1161,7 +1178,7 @@ static int send_to_kannel(struct sms *sms, unsigned ref)
         return rc;
 }
 
-static int send_dlr_to_kannel(unsigned ref, int state)
+static int send_dlr_to_kannel(int state, char *mid, char *to)
 {
         CURL *curl;
         CURLcode res;
@@ -1169,7 +1186,10 @@ static int send_dlr_to_kannel(unsigned ref, int state)
      	int rc = 1;
 
         // CREATE DLR FOR KANNEL
-        sprintf(buf, "%s/?to=31632271497&dlr-mask=%d?dlr-mid=%u", DLR_SERVER_HOST, state, ref);
+        sprintf(buf, "%s/sms?username=spup&password=spup&dlr-mask=%d&dlr-mid=%s&to=%s&smsc=pgsm",
+							DLR_SERVER_HOST, state, mid, to);
+
+	printf("dlr-url %s\n", buf);
 
         // SEND THE REQUEST
         curl = curl_easy_init();
