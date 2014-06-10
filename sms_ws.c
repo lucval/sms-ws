@@ -287,11 +287,10 @@ static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
 
 	if (tsx->role == PJSIP_ROLE_UAS) {
 		if (tsx->state == PJSIP_TSX_STATE_COMPLETED
-		    || tsx->state == PJSIP_TSX_STATE_CONFIRMED)
+		   || tsx->state == PJSIP_TSX_STATE_CONFIRMED)
 		{
 			PJ_LOG(3,(THIS_FILE, "[%u] UAS state CONFIRMED (%d)", session->ref, tsx->status_code));
 
-			// IS IT NEEDED???
 			if (tsx->status_code == 200)
 				headers(session->client);
 			else
@@ -565,7 +564,7 @@ static int handle_sms(struct sms *sms, int client)
 	return 1;
 }
 
-static int handle_dlr(struct dlr *dlr, unsigned ref, int client)
+static int handle_dlr(struct dlr *dlr, int client, unsigned ref)
 {
 	pj_status_t status;
 	int status_code;
@@ -594,7 +593,7 @@ static int handle_dlr(struct dlr *dlr, unsigned ref, int client)
 		break;
 	case MESSAGE_BUFFERED:
 	case SMSC_SUBMIT:
-		return 0; //should I update proxy state here?
+		return 1; //should I update proxy state here?
 	case SMSC_REJECT:
 		if (!strcmp(dlr->cause, DLR_404)) {
                         status_code = 404;
@@ -684,7 +683,7 @@ static int init_sip(void)
         	return 0;
     	}
 
-        // CREATE THE ENDPOINT
+        // CREATE ENDPOINT
         status = pjsip_endpt_create(&cp.factory, pj_gethostname()->ptr, &sip_endpt);
         if (status != PJ_SUCCESS) {
                app_perror("Failed to init PJLIB", status);
@@ -795,6 +794,8 @@ static void headers(int client)
 	send(client, buf, strlen(buf), 0);
 	sprintf(buf, "Content-Type: text/html\r\n");
 	send(client, buf, strlen(buf), 0);
+	sprintf(buf, "\r\n");
+        send(client, buf, strlen(buf), 0);
 	sprintf(buf, "<P>Ok.\r\n");
 	send(client, buf, strlen(buf), 0);
 
@@ -1079,10 +1080,8 @@ static void accept_http_request(int client)
                         }
                         ref = atoi(token);
 			// HANDLE DELIVERY REPORT
-			if (handle_dlr(&dlr, ref, client))
-				accepted(client); //HTTP 202
-                        else
-                                cannot_execute(client); //HTTP 500
+			if (!handle_dlr(&dlr, client, ref))
+				cannot_execute(client); //HTTP 500
 		}
 		else if (!strcmp(service, "/sms")) {
 			// TO
@@ -1100,7 +1099,7 @@ static void accept_http_request(int client)
                                 bad_request(client);
                                 return;
                         }
-                        strncpy(sms.text, token, TEXT_LENGTH);
+                        strncpy(sms.text, curl_unescape(token, 0), TEXT_LENGTH);
 			// FROM
 			token = strstrtok(NULL, "from=");
                 	token = strstrtok(NULL, "&");
@@ -1118,9 +1117,7 @@ static void accept_http_request(int client)
 	                }
         	        strncpy(sms.orig_smsc, token, SMSC_LENGTH);
 			// HANDLE INCOMING SMS
-			if (handle_sms(&sms, client))
-				accepted(client); //HTTP 202
-			else
+			if (!handle_sms(&sms, client))
 				cannot_execute(client); //HTTP 500
 	        }
 		else
@@ -1143,12 +1140,12 @@ static int send_to_kannel(struct sms *sms, unsigned ref)
 	int rc = 1;
 
 	// CREATE SENDSMS REQUEST
-        sprintf(sendsms, SENDSMS_REQUEST, sms->from, sms->to, sms->text, sms->dest_smsc);
+        sprintf(sendsms, SENDSMS_REQUEST, sms->from, sms->to, curl_escape(sms->text, 0), sms->dest_smsc);
 	//printf("sendsms request: %s\n", sendsms); //DEBUG
 
 	// CREATE DLR URL
         sprintf(dlr_url, "%s%u", DLR_URL, ref);
-	printf("%s\n", dlr_url); //DEBUG
+	//printf("%s\n", dlr_url); //DEBUG
 
 	// UNITE THEM TO FORM KANNEL'S HTTP REQUEST
         sprintf(buf, "%s%s%s", SERVER_HOST, sendsms, curl_escape(dlr_url, 0));
