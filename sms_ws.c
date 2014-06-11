@@ -4,7 +4,6 @@
 
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <pthread.h>
 
 #include <curl/curl.h>
 
@@ -50,14 +49,14 @@ struct dlr {
 };
 
 static void headers(int client);
-static void accepted(int client);
+//static void accepted(int client);
 static void bad_request(int client);
 static void not_found(int client);
 static void cannot_execute(int client);
 static void unimplemented(int client);
 
 static int send_to_kannel(struct sms *sms, unsigned ref);
-static int send_dlr_to_kannel(int dlr_state, char *fid, char *to);
+//static int send_dlr_to_kannel(int dlr_state, char *fid, char *to);
 
 char *strstrtok(char *str, char *delim)
 {
@@ -91,6 +90,9 @@ char *strstrtok(char *str, char *delim)
 
 /* memory stuffs */
 static pj_caching_pool cp;
+
+/* threading */
+pj_pool_t *threads_pool;
 
 /* mutex */
 pj_pool_t *mutex_pool;
@@ -258,7 +260,7 @@ void app_perror(const char *msg, pj_status_t rc)
     	PJ_LOG(1,(THIS_FILE, "%s: [pj_status_t=%d] %s", msg, rc, errbuf));
 }
 
-static int init_pj_thread(void)
+/*static int init_pj_thread(void)
 {
 	pj_thread_desc desc;
 	pj_thread_t *this_thread;
@@ -272,7 +274,7 @@ static int init_pj_thread(void)
 	}
 
 	return 1;
-}
+}*/
 
 /* Callback to be called when transaction session's state has changed */
 static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
@@ -409,8 +411,10 @@ static void process_proxy_request(pjsip_rx_data *rdata)
 
 	// PRINT CALL-ID
         pj_strdup(session->pool, &cid, &rdata->msg_info.cid->id);
-	strtok((char*)pj_strbuf(&cid), CID_DELIMITERS);
-	PJ_LOG(3,(THIS_FILE, "[%u] ***Call-ID*** %s", session->ref, pj_strbuf(&cid)));
+	char test[1024];
+	strcpy(test, (char*)pj_strbuf(&cid));
+	strtok(test, CID_DELIMITERS);
+	PJ_LOG(3,(THIS_FILE, "[%u] ***Call-ID*** %s", session->ref, test));
 
 	// PARSE PROXY REQUEST
 	parse_prx_request(rdata, &sms);
@@ -496,9 +500,6 @@ static int handle_sms(struct sms *sms, int client)
 	char target_c[255], from_c[255];
 	struct sms_session *session;
 
-	if (!init_pj_thread())
-		return 0;
-
 	// CREATE REQUEST MESSAGE
 	sprintf(target_c, "sip:%s@%s", sms->to, PRX_DOMAIN);
     	sprintf(from_c, "sip:%s@%s:%d", sms->from, LOCAL_ADDRESS, SIP_PORT);
@@ -570,9 +571,6 @@ static int handle_dlr(struct dlr *dlr, int client, unsigned ref)
 	int status_code;
 	struct sms_session *session;
 
-	if (!init_pj_thread())
-                return 0;
-
 	PJ_LOG(4,(THIS_FILE, "handle DLR"));
 
 	if (!(session = find_session(ref))) {
@@ -629,17 +627,16 @@ internal_error:
 
 }
 
-static void accept_sip_requests(void)
+static int accept_sip_requests(void *arg)
 {
-	if (!init_pj_thread())
-		return;
+	PJ_UNUSED_ARG(arg);
 
 	while (1) {
                 pj_time_val delay = {0, 10};
                 pjsip_endpt_handle_events(sip_endpt, &delay);
         }
 
-	return;
+	return 0;
 }
 
 /* Init SIP stack */
@@ -668,6 +665,13 @@ static int init_sip(void)
 
         // CREATE POOL FACTORY BEFORE ALLOCATE ANY MEMORY
         pj_caching_pool_init(&cp, &pj_pool_factory_default_policy, 0);
+
+	// INIT THREAD POOL
+	threads_pool = pj_pool_create(&cp.factory, "sip_threads", 1000, 1000, NULL);
+	if (!threads_pool) {
+                app_perror("Failed to create SIP threads pool", PJ_ENOMEM);
+                return 0;
+        }
 
 	// INIT MUTEX POOL
         mutex_pool = pj_pool_create(&cp.factory, "mutex", 1000, 1000, NULL);
@@ -805,7 +809,7 @@ static void headers(int client)
 }
 
 /* 202 Accepted message */
-static void accepted(int client)
+/*static void accepted(int client)
 {
 	//DEBUG
         //printf("202 ACCEPTED  %d\n", client);
@@ -825,7 +829,7 @@ static void accepted(int client)
 	send(client, buf, strlen(buf), 0);
 	sprintf(buf, "<P>Accepted request.\r\n");
 	send(client, buf, strlen(buf), 0);
-}
+}*/
 
 /* 400 Bad Request message */
 static void bad_request(int client)
@@ -986,7 +990,7 @@ static int get_line(int sock, char *buf, int size)
 }
 
 /* parse and process incoming HTTP request */
-static void accept_http_request(int client)
+static int accept_http_request(int client)
 {
 	struct sms sms;
 	struct dlr dlr;
@@ -1018,7 +1022,7 @@ static void accept_http_request(int client)
         }
         else {
                 bad_request(client);
-                return;
+                return 0;
         }
 
 	// WE ONLY PROCESS GET REQUESTS
@@ -1028,7 +1032,7 @@ static void accept_http_request(int client)
 		service = strstrtok(url, "?");
 		if (!service) {
 			bad_request(client);
-                        return;
+                        return 0;
                 }
 		if (!strcmp(service, "/dlr")) {
 			// DLR TYPE
@@ -1036,7 +1040,7 @@ static void accept_http_request(int client)
 			token = strstrtok(NULL, "&");
 			if (!token) {
                                 bad_request(client);
-                                return;
+                                return 0;
                         }
 			dlr.type = atoi(token);
 			// DLR CAUSE
@@ -1044,7 +1048,7 @@ static void accept_http_request(int client)
                         token = strstrtok(NULL, "&");
                         if (!token) {
                                 bad_request(client);
-                                return;
+                                return 0;
                         }
                         strncpy(dlr.cause, curl_unescape(token, 0), sizeof(dlr.cause));
 			// FOREIGN MSG ID
@@ -1052,7 +1056,7 @@ static void accept_http_request(int client)
 			token = strstrtok(NULL, "&");
                         if (!token) {
                                 bad_request(client);
-                                return;
+                                return 0;
                         }
 			strncpy(dlr.fid, curl_unescape(token, 0), FID_LENGTH);
 			// TO
@@ -1060,7 +1064,7 @@ static void accept_http_request(int client)
                         token = strstrtok(NULL, "&");
                         if (!token) {
                                 bad_request(client);
-                                return;
+                                return 0;
                         }
 			strncpy(dlr.to, token, MSISDN_LENGTH);
 			// META-DATA
@@ -1068,7 +1072,7 @@ static void accept_http_request(int client)
                         token = strstrtok(NULL, "&");
                         if (!token) {
                                 bad_request(client);
-                                return;
+                                return 0;
                         }
                         strncpy(dlr.metadata, curl_unescape(token, 0), sizeof(dlr.metadata));
 			// REF
@@ -1076,7 +1080,7 @@ static void accept_http_request(int client)
 			token = strstrtok(NULL, "&");
                         if (!token) {
                                 bad_request(client);
-                                return;
+                                return 0;
                         }
                         ref = atoi(token);
 			// HANDLE DELIVERY REPORT
@@ -1089,7 +1093,7 @@ static void accept_http_request(int client)
 			token = strstrtok(NULL, "&");
         	        if (!token) {
                 	        bad_request(client);
-                        	return;
+                        	return 0;
 	                }
         	        strncpy(sms.to, token, MSISDN_LENGTH);
 			// TEXT
@@ -1097,7 +1101,7 @@ static void accept_http_request(int client)
                         token = strstrtok(NULL, "&");
                         if (!token) {
                                 bad_request(client);
-                                return;
+                                return 0;
                         }
                         strncpy(sms.text, curl_unescape(token, 0), TEXT_LENGTH);
 			// FROM
@@ -1105,7 +1109,7 @@ static void accept_http_request(int client)
                 	token = strstrtok(NULL, "&");
 	                if (!token) {
         	                bad_request(client);
-                	        return;
+                	        return 0;
 	                }
         	        strncpy(sms.from, token, MSISDN_LENGTH);
 			// ORIGIN SMSC
@@ -1113,7 +1117,7 @@ static void accept_http_request(int client)
                 	token = strstrtok(NULL, "&");
 	                if (!token) {
         	                bad_request(client);
-                	        return;
+                	        return 0;
 	                }
         	        strncpy(sms.orig_smsc, token, SMSC_LENGTH);
 			// HANDLE INCOMING SMS
@@ -1128,7 +1132,7 @@ static void accept_http_request(int client)
 		// WRONG METHOD
                	unimplemented(client);
 
-	return;
+	return 0;
 }
 
 /* Send SMS to Kannel */
@@ -1176,7 +1180,7 @@ static int send_to_kannel(struct sms *sms, unsigned ref)
         return rc;
 }
 
-static int send_dlr_to_kannel(int state, char *fid, char *to)
+/*static int send_dlr_to_kannel(int state, char *fid, char *to)
 {
         CURL *curl;
         CURLcode res;
@@ -1207,7 +1211,7 @@ static int send_dlr_to_kannel(int state, char *fid, char *to)
         }
 
         return rc;
-}
+}*/
 
 /* This function starts the process of listening for web connections
  * on a specified port.  If the port is 0, dynamically allocate one
@@ -1250,15 +1254,12 @@ int main(void)
 		return 0;
 	}
 
-	pthread_t sipthread;
-	if (pthread_create(&sipthread, NULL, (void *) accept_sip_requests, NULL) != 0)
-        	perror("SIP pthread_create");
+	pj_thread_t *sip_thread;
+	pj_thread_create(threads_pool, "sip_thread", &accept_sip_requests, NULL,
+			  0, 0, &sip_thread);
 
 	server_sock = startup(&port);
         printf("httpd running on port %d\n", port);
-
-	if (!init_pj_thread())
-                return 0;
 
  	while (1) {
   		client_sock = accept(server_sock,
@@ -1266,9 +1267,10 @@ int main(void)
                         &client_name_len);
   		if (client_sock == -1)
    			error_die("accept");
-		pthread_t httpthread;
- 		if (pthread_create(&httpthread, NULL, (void *) accept_http_request, client_sock) != 0)
-   			perror("HTTP pthread_create");
+		pj_thread_t *http_thread;
+        	pj_thread_create(threads_pool, "http_thread", &accept_http_request,
+					client_sock, 0, 0, &http_thread);
+
  	}
 
  	close(server_sock);
