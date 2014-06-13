@@ -1142,7 +1142,7 @@ static int send_to_kannel(struct sms *sms, unsigned ref)
         sprintf(buf, "%s%s%s", SERVER_HOST, sendsms, curl_escape(dlr_url, 0));
 
 	// SEND THE REQUEST
-        curl = curl_easy_init();
+	curl = curl_easy_init();
         if (curl) {
                 curl_easy_setopt(curl, CURLOPT_URL, buf);
 
@@ -1160,7 +1160,7 @@ static int send_to_kannel(struct sms *sms, unsigned ref)
 		rc = http_code;
 
 	out:
-                curl_easy_cleanup(curl);
+		curl_easy_cleanup(curl);
 		printf("  (%d) \n", rc);
         }
 
@@ -1251,7 +1251,7 @@ int main(void)
   		if (client_sock == -1)
    			error_die("accept");
 		accept_http_request(client_sock);
- 	}
+	}
 
  	close(server_sock);
 	destroy_sip();
