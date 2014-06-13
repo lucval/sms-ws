@@ -78,21 +78,26 @@ char *strstrtok(char *str, char *delim)
  * SIP INTERFACE *
  *****************/
 
-#define THIS_FILE 		"sms_ws.c"
-#define LOCAL_ADDRESS 		"193.169.138.177"
-#define SIP_PORT 		6060
-//#define PRX_DOMAIN 		"devprx01.speakup.nl:5065;transport=udp"
-#define PRX_DOMAIN      	"193.169.138.177:7070"
+#define THIS_FILE 	"sms_ws.c"
+#define LOCAL_ADDRESS 	"193.169.138.177"
+#define SIP_PORT 	6060
+//#define PRX_DOMAIN 	"devprx01.speakup.nl:5065;transport=udp"
+#define PRX_DOMAIN      "193.169.138.177:7070"
 
-#define CID_DELIMITERS		"! \n"
+#define CID_DELIMITERS	"! \n"
 
-#define TOTAG_LENGTH		8
-
-#define HANDLE_SMS_TIMER 	10
-#define HANDLE_DLR_TIMER 	0
+#define TOTAG_LENGTH	8
 
 /* memory stuffs */
 static pj_caching_pool cp;
+
+/* threading */
+pj_pool_t *sip_pool;
+pj_pool_t *threads_pool;
+
+/* mutex */
+pj_pool_t *mutex_pool;
+pj_mutex_t *sip_mutex;
 
 /* SIP endpoint */
 static pjsip_endpoint *sip_endpt;
@@ -117,7 +122,6 @@ struct sms_session
 	pj_pool_t *pool;
     	pjsip_transaction *tsx;		/* UAS/UAC transaction */
 	pjsip_tx_data *uas_tdata;	/* tx data buffer (only for UAS) */
-	pj_timer_entry d_timer;	    	/* Disconnect timer */
 };
 
 /* Create an SMS session */
@@ -126,12 +130,16 @@ static struct sms_session *create_session(void)
 	struct sms_session *s;
 	pj_pool_t *pool;
 
+	pj_mutex_lock(sip_mutex);
+
 	PJ_LOG(4,(THIS_FILE, "create session"));
 
 	// INIT SMS SESSION POOL
 	pool = pj_pool_create(&cp.factory, NULL, 1000, 1000, NULL);
-	if (!pool)
+	if (!pool) {
+		pj_mutex_unlock(sip_mutex);
 		return NULL;
+	}
 
         // INIT SMS SESSION STRUCTURE
         s = pj_pool_zalloc(pool, sizeof(struct sms_session));
@@ -139,6 +147,7 @@ static struct sms_session *create_session(void)
 	s->pool = pool;
 	s->ref = g_callref++;
 
+	pj_mutex_unlock(sip_mutex);
 	return s;
 }
 
@@ -147,21 +156,27 @@ static struct sms_session *find_session(unsigned ref)
 {
 	struct sms_session *s;
 
+	pj_mutex_lock(sip_mutex);
+
 	list_for_each_entry(s, &sms_session_list, entry) {
 		if (s->ref == ref) {
 			PJ_LOG(5,(THIS_FILE, "session found"));
+			pj_mutex_unlock(sip_mutex);
 			return s;
 		}
 	}
 
 	PJ_LOG(4,(THIS_FILE, "session not found"));
 
+	pj_mutex_unlock(sip_mutex);
 	return NULL;
 }
 
 /* Destroy an SMS session */
 static void destroy_session(struct sms_session *s)
 {
+	pj_mutex_lock(sip_mutex);
+
 	// safety
 	if (!s) return;
 
@@ -173,6 +188,7 @@ static void destroy_session(struct sms_session *s)
 		pj_pool_release(s->pool);
 	s = NULL;
 
+	pj_mutex_unlock(sip_mutex);
 	return;
 }
 
@@ -205,7 +221,7 @@ static pjsip_module mod_sip_in =
     	NULL,			    		/* unload()		*/
     	&rx_request,		    		/* on_rx_request()	*/
     	NULL,			    		/* on_rx_response()	*/
-    	NULL,			    		/* on_tx_request()	*/
+    	NULL,			    		/* on_tx_request.	*/
     	NULL,			    		/* on_tx_response()	*/
     	NULL,				    	/* on_tsx_state()	*/
 };
@@ -227,7 +243,7 @@ static pjsip_module mod_sip_tsx =
         NULL,                                   /* unload()             */
         NULL,		                        /* on_rx_request()      */
         NULL,                                   /* on_rx_response()     */
-        NULL,                                   /* on_tx_request()      */
+        NULL,                                   /* on_tx_request.       */
         NULL,                                   /* on_tx_response()     */
         &tsx_state_changed,                     /* on_tsx_state()       */
 };
@@ -243,6 +259,22 @@ void app_perror(const char *msg, pj_status_t rc)
     	PJ_LOG(1,(THIS_FILE, "%s: [pj_status_t=%d] %s", msg, rc, errbuf));
 }
 
+/*static int init_pj_thread(void)
+{
+	pj_thread_desc desc;
+	pj_thread_t *this_thread;
+	pj_status_t status;
+
+	pj_bzero(desc, sizeof(desc));
+	status = pj_thread_register(NULL, desc, &this_thread);
+	if (status != PJ_SUCCESS) {
+		app_perror("error in pj_thread_register", status);
+		return 0;
+	}
+
+	return 1;
+}*/
+
 /* Callback to be called when transaction session's state has changed */
 static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
 {
@@ -255,23 +287,19 @@ static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
 	PJ_LOG(4,(THIS_FILE, "tsx state changes (new state->%d)", tsx->state));
 
 	if (tsx->role == PJSIP_ROLE_UAS) {
-		if (tsx->state == PJSIP_TSX_STATE_COMPLETED) {
+		if (tsx->state == PJSIP_TSX_STATE_COMPLETED
+		   || tsx->state == PJSIP_TSX_STATE_CONFIRMED)
+		{
+			PJ_LOG(3,(THIS_FILE, "[%u] UAS state CONFIRMED (%d)", session->ref, tsx->status_code));
 
-			PJ_LOG(3,(THIS_FILE, "[%u] UAS state COMPLETED (%d)",
-						session->ref, tsx->status_code));
+			if (tsx->status_code == 200)
+				headers(session->client);
+			else
+				cannot_execute(session->client);
 
 		} else if (tsx->state == PJSIP_TSX_STATE_TERMINATED) {
 
 			PJ_LOG(3,(THIS_FILE, "[%u] UAS state TERMINATED", session->ref));
-			if (session->d_timer.id != 0) {
-                                pjsip_endpt_cancel_timer(sip_endpt, &session->d_timer);
-                                session->d_timer.id = 0;
-                        }
-
-			if (tsx->status_code == 200)
-                                headers(session->client);
-                        else
-                                cannot_execute(session->client);
 
 			destroy_session(session);
 
@@ -280,22 +308,17 @@ static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
 	} else {
 		if (tsx->state == PJSIP_TSX_STATE_COMPLETED) {
 
-			PJ_LOG(3,(THIS_FILE, "[%u] UAC state COMPLETED (%d)",
-						session->ref, tsx->status_code));
+			PJ_LOG(3,(THIS_FILE, "[%u] UAC state COMPLETED (%d)", session->ref, tsx->status_code));
+
+			if (tsx->status_code == 200)
+				headers(session->client);
+                        else
+                                cannot_execute(session->client);
+
 
 		} else if (tsx->state == PJSIP_TSX_STATE_TERMINATED) {
 
 			PJ_LOG(3,(THIS_FILE, "[%u] UAC state TERMINATED", session->ref));
-
-			if (session->d_timer.id != 0) {
-                                pjsip_endpt_cancel_timer(sip_endpt, &session->d_timer);
-                                session->d_timer.id = 0;
-                        }
-
-			if (tsx->status_code == 200)
-                                headers(session->client);
-                        else
-                                cannot_execute(session->client);
 
                         destroy_session(session);
 
@@ -465,19 +488,6 @@ static pj_bool_t rx_request(pjsip_rx_data *rdata)
     	return PJ_TRUE;
 }
 
-/* Callback timer to terminate session */
-static void timer_terminate_session(pj_timer_heap_t *timer_heap,
-				   struct pj_timer_entry *entry)
-{
-	struct sms_session *session = entry->user_data;
-
-	PJ_UNUSED_ARG(timer_heap);
-
-	entry->id = 0;
-	if (session && session->tsx)
-		pjsip_tsx_terminate(session->tsx, PJSIP_SC_REQUEST_TERMINATED);
-}
-
 static int handle_sms(struct sms *sms, int client)
 {
     	pjsip_tx_data *tdata;
@@ -487,8 +497,8 @@ static int handle_sms(struct sms *sms, int client)
 	struct sms_session *session;
 
 	// CREATE REQUEST MESSAGE
-	sprintf(target_c, "<sip:%s@%s>", sms->to, PRX_DOMAIN);
-    	sprintf(from_c, "<sip:%s@%s:%d;transport=udp>", sms->from, LOCAL_ADDRESS, SIP_PORT);
+	sprintf(target_c, "sip:%s@%s", sms->to, PRX_DOMAIN);
+    	sprintf(from_c, "sip:%s@%s:%d", sms->from, LOCAL_ADDRESS, SIP_PORT);
 
 	target = pj_str(target_c);
 	from = pj_str(from_c);
@@ -547,24 +557,6 @@ static int handle_sms(struct sms *sms, int client)
 		return 0;
 	}
 
-#ifdef HANDLE_SMS_TIMER
-	session->d_timer.id = 1;
-	session->d_timer.user_data = session;
-	session->d_timer.cb = &timer_terminate_session;
-
-	pj_time_val t;
-	t.sec = HANDLE_SMS_TIMER;
-	t.msec = 0;
-
-	pjsip_endpt_schedule_timer(sip_endpt, &session->d_timer, &t);
-#endif
-
-	unsigned ref = session->ref;
-	while (find_session(ref)) {
-		/* Accept incoming SIP requests */
-		pj_time_val delay = {0, 10};
-		pjsip_endpt_handle_events(sip_endpt, &delay);
-	}
 	return 1;
 }
 
@@ -619,23 +611,6 @@ static int handle_dlr(struct dlr *dlr, int client, unsigned ref)
         if (status != PJ_SUCCESS)
                 goto internal_error;
 
-#ifdef HANDLE_DLR_TIMER
-        session->d_timer.id = 1;
-        session->d_timer.user_data = session;
-        session->d_timer.cb = &timer_terminate_session;
-
-        pj_time_val t;
-        t.sec = HANDLE_DLR_TIMER;
-        t.msec = 0;
-
-        pjsip_endpt_schedule_timer(sip_endpt, &session->d_timer, &t);
-#endif
-
-        while (find_session(ref)) {
-		/* Accept incoming SIP requests */
-		pj_time_val delay = {0, 10};
-		pjsip_endpt_handle_events(sip_endpt, &delay);
-	}
 	return 1;
 
 internal_error:
@@ -645,6 +620,18 @@ internal_error:
 	pjsip_tsx_send_msg(session->tsx, session->uas_tdata);
         return 0;
 
+}
+
+static int accept_sip_requests(void *arg)
+{
+	PJ_UNUSED_ARG(arg);
+
+	while (1) {
+                pj_time_val delay = {0, 10};
+                pjsip_endpt_handle_events(sip_endpt, &delay);
+        }
+
+	return 0;
 }
 
 /* Init SIP stack */
@@ -673,6 +660,33 @@ static int init_sip(void)
 
         // CREATE POOL FACTORY BEFORE ALLOCATE ANY MEMORY
         pj_caching_pool_init(&cp, &pj_pool_factory_default_policy, 0);
+
+	// INIT THREAD POOL
+	threads_pool = pj_pool_create(&cp.factory, "http_threads", 1000, 1000, NULL);
+	if (!threads_pool) {
+                app_perror("Failed to create SIP threads pool", PJ_ENOMEM);
+                return 0;
+        }
+
+	sip_pool = pj_pool_create(&cp.factory, "sip_threads", 1000, 1000, NULL);
+        if (!sip_pool) {
+                app_perror("Failed to create SIP threads pool", PJ_ENOMEM);
+                return 0;
+        }
+
+	// INIT MUTEX POOL
+        mutex_pool = pj_pool_create(&cp.factory, "mutex", 1000, 1000, NULL);
+        if (!mutex_pool) {
+		app_perror("Failed to create mutex pool", PJ_ENOMEM);
+                return 0;
+	}
+
+	// CREATE MUTEX
+	status = pj_mutex_create(mutex_pool, "", PJ_MUTEX_SIMPLE, &sip_mutex);
+    	if (status != PJ_SUCCESS) {
+        	app_perror("Failed to create mutex", status);
+        	return 0;
+    	}
 
         // CREATE ENDPOINT
         status = pjsip_endpt_create(&cp.factory, pj_gethostname()->ptr, &sip_endpt);
@@ -1241,6 +1255,10 @@ int main(void)
 		return 0;
 	}
 
+	pj_thread_t *sip_thread;
+	pj_thread_create(sip_pool, "sip_thread", &accept_sip_requests, NULL,
+				  0, 0, &sip_thread);
+
 	server_sock = startup(&port);
         printf("httpd running on port %d\n", port);
 
@@ -1250,7 +1268,9 @@ int main(void)
                         &client_name_len);
   		if (client_sock == -1)
    			error_die("accept");
-		accept_http_request(client_sock);
+		pj_thread_t *http_thread;
+        	pj_thread_create(threads_pool, "http_thread", &accept_http_request,
+					client_sock, 0, 0, &http_thread);
  	}
 
  	close(server_sock);

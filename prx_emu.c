@@ -230,18 +230,19 @@ static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
 		return;
 
 	//DEBUG
-	printf("tsx state changed\n");
+	PJ_LOG(1,(THIS_FILE, "tsx state changes (new state->%d)", tsx->state));
 
 	if (tsx->role == PJSIP_ROLE_UAS) {
-		if (tsx->state == PJSIP_TSX_STATE_CONFIRMED) {
+		if (tsx->state == PJSIP_TSX_STATE_CONFIRMED
+		  || tsx->state == PJSIP_TSX_STATE_COMPLETED) {
 
-			 printf("to confirmed?\n");
+			PJ_LOG(1,(THIS_FILE, "UAS state CONFIRMED (%d)", tsx->status_code));
 
 			session->state = SUCCESS;
 
 		} else if (tsx->state == PJSIP_TSX_STATE_TERMINATED) {
 
-			 printf("to terminated?\n");
+			PJ_LOG(1,(THIS_FILE, "UAS state TERMINATED"));
 
 			if (session->d_timer.id != 0) {
                                 pjsip_endpt_cancel_timer(sip_endpt, &session->d_timer);
@@ -260,13 +261,15 @@ static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
 	} else {
 		if (tsx->state == PJSIP_TSX_STATE_COMPLETED) {
 
-			printf("to completed?\n");
+			PJ_LOG(1,(THIS_FILE, "UAC state COMPLETED (%d)", tsx->status_code));
 
 			session->state = SUCCESS;
 
+			pjsip_tsx_terminate(tsx, 200);
+
 		} else if (tsx->state == PJSIP_TSX_STATE_TERMINATED) {
 
-			printf("or terminated?\n");
+			PJ_LOG(1,(THIS_FILE, "UAC state TERMINATED"));
 
 			if (session->d_timer.id != 0) {
                                 pjsip_endpt_cancel_timer(sip_endpt, &session->d_timer);
