@@ -435,7 +435,22 @@ static int handle_sms(struct sms *sms)
 
         pjsip_generic_string_hdr x_carr;
 	pj_str_t hname = pj_str("X-SpeakUp-Carrier-Select");
-	pj_str_t hvalue = pj_str("pgsm");
+	pj_str_t hvalue;
+	if (!(strcmp(sms->to, "31632271490")) ||
+	    !(strcmp(sms->to, "31632271491")) ||
+            !(strcmp(sms->to, "31632271492")) ||
+            !(strcmp(sms->to, "31632271493")) ||
+            !(strcmp(sms->to, "31632271494")) ||
+            !(strcmp(sms->to, "31632271495")) ||
+            !(strcmp(sms->to, "31632271496")) ||
+            !(strcmp(sms->to, "31632271497")) ||
+            !(strcmp(sms->to, "31632271498")) ||
+            !(strcmp(sms->to, "31632271499"))) {
+		hvalue = pj_str("mcs");
+	}
+	else {
+		hvalue = pj_str("cm");
+	}
 	pjsip_generic_string_hdr_init2(&x_carr, &hname, &hvalue);
         pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)&x_carr);
 

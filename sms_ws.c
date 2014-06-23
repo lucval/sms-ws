@@ -83,6 +83,7 @@ char *strstrtok(char *str, char *delim)
 #define SIP_PORT 		6060
 //#define PRX_DOMAIN 		"devprx01.speakup.nl:5065;transport=udp"
 #define PRX_DOMAIN      	"193.169.138.177:7070"
+#define DUMMY_PRX		1
 
 #define CID_DELIMITERS		"! \n"
 
@@ -252,7 +253,8 @@ static void tsx_state_changed(pjsip_transaction *tsx, pjsip_event *e)
 	if (!session)
 		return;
 
-	PJ_LOG(4,(THIS_FILE, "tsx state changes (new state->%d)", tsx->state));
+	PJ_LOG(4,(THIS_FILE, "tsx state changes, new state->%d (%d)",
+				tsx->state, tsx->status_code));
 
 	if (tsx->role == PJSIP_ROLE_UAS) {
 		if (tsx->state == PJSIP_TSX_STATE_COMPLETED) {
@@ -425,6 +427,12 @@ static void process_proxy_request(pjsip_rx_data *rdata)
                 goto internal_error_stateful;
         }
 
+#ifdef DUMMY_PRX
+	// avoid retransmission if DLR is delayed or missing
+	pjsip_endpt_create_response(sip_endpt, rdata, 202, NULL, &tdata);
+        pjsip_tsx_send_msg(session->tsx, tdata);
+#endif
+
 	// DONE
 	return;
 
@@ -438,7 +446,7 @@ internal_error_stateful:
         // RESPOND WITH 500 (Internal Server Error)
         PJ_LOG(3,(THIS_FILE, "[%u] Internal error (reason: %s)",
 				session->ref, pj_strbuf(&reason)));
-        pjsip_endpt_create_response(sip_endpt, rdata, 200, &reason, &tdata);
+        pjsip_endpt_create_response(sip_endpt, rdata, 500, &reason, &tdata);
 	pjsip_tsx_send_msg(session->tsx, tdata);
         return;
 }
@@ -488,7 +496,7 @@ static int handle_sms(struct sms *sms, int client)
 
 	// CREATE REQUEST MESSAGE
 	sprintf(target_c, "<sip:%s@%s>", sms->to, PRX_DOMAIN);
-    	sprintf(from_c, "<sip:%s@%s:%d;transport=udp>", sms->from, LOCAL_ADDRESS, SIP_PORT);
+    	sprintf(from_c, "<sip:%s@%s:%d>", sms->from, LOCAL_ADDRESS, SIP_PORT);
 
 	target = pj_str(target_c);
 	from = pj_str(from_c);
@@ -583,6 +591,8 @@ static int handle_dlr(struct dlr *dlr, int client, unsigned ref)
 	session->client = client;
 
 	PJ_LOG(3,(THIS_FILE, "[%u] DLR: type=%d", session->ref, dlr->type));
+	PJ_LOG(3,(THIS_FILE, "[%u] DLR: cause=%s, meta-data=%s",
+			session->ref, dlr->cause, dlr->metadata));
 
 	switch (dlr->type) {
 	case DELIVERY_SUCCESS:
@@ -613,11 +623,13 @@ static int handle_dlr(struct dlr *dlr, int client, unsigned ref)
 	// UPDATE RESPONSE
 	session->uas_tdata->msg->line.status.code = status_code;
 
+#ifndef DUMMY_PRX
 	// SEND RESPONSE
 	PJ_LOG(3,(THIS_FILE, "send %d response to the proxy", status_code));
         status = pjsip_tsx_send_msg(session->tsx, session->uas_tdata);
         if (status != PJ_SUCCESS)
                 goto internal_error;
+#endif
 
 #ifdef HANDLE_DLR_TIMER
         session->d_timer.id = 1;
@@ -1011,6 +1023,8 @@ static int accept_http_request(int client)
                 bad_request(client);
                 return 0;
         }
+
+	//printf("%s\n", url);
 
 	// WE ONLY PROCESS GET REQUESTS
         if (strcasecmp(method, "GET") == 0) {
